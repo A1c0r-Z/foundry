@@ -74,6 +74,70 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     ::foundry::preallocate_cublas_workspaces();
   }, "Pre-allocate cuBLAS and cuBLASLt handles and workspaces for the current stream");
 
+  // ─────────────────────────────────────────────────────────────────────
+  // Passthrough recording APIs — vllm-cold-start expects these names.
+  // Internally they map to Foundry's existing start/end/pause/resume_hook_record
+  // (with extra recording added to the bump-disabled passthrough code path).
+  // ─────────────────────────────────────────────────────────────────────
+  m.def("start_passthrough_record", []() {
+    // Do NOT clear events here — fallback allocations made BEFORE the user
+    // calls start_passthrough_record (e.g. during Foundry's region setup,
+    // weights loading, NCCL init) are recorded unconditionally and must
+    // be preserved so the load process can replay the full allocation
+    // sequence. Use a separate clear_passthrough_record() if a clean slate
+    // is genuinely needed.
+    ::foundry::start_hook_record();
+  }, "Begin recording non-bump-region GPU allocations (cuMemAlloc_v2 / cuMemAllocPitch_v2 / cuMemAddressReserve / cuMem* fallbacks).");
+
+  m.def("end_passthrough_record", []() {
+    ::foundry::end_hook_record();
+  }, "Stop recording allocations. Events stay in the buffer until cleared.");
+
+  m.def("pause_passthrough_record", []() {
+    ::foundry::pause_hook_record();
+  }, "Temporarily stop recording without clearing events.");
+
+  m.def("resume_passthrough_record", []() {
+    ::foundry::resume_hook_record();
+  }, "Resume recording without clearing events.");
+
+  m.def("get_passthrough_events", []() {
+    auto events = ::foundry::get_hook_events_simple();
+    py::list result;
+    for (const auto& tup : events) {
+      py::dict d;
+      d["source"] = std::get<0>(tup);
+      d["ptr"]    = std::get<1>(tup);
+      d["size"]   = std::get<2>(tup);
+      result.append(d);
+    }
+    return result;
+  }, "Return list of dicts {source: str, ptr: int, size: int} for each recorded allocation.");
+
+  // Direction 1: replay save-time passthrough events on load side.
+  // Walks events in order, calls cuMemAlloc_v2(size) for each "alloc" event,
+  // which routes through Foundry's bump allocator and advances the cursor.
+  // After replay, load process's bump cursor matches save process's, so
+  // graph-baked addresses are valid without external patching.
+  m.def("replay_passthrough_events", [](const py::list& events) {
+    std::vector<std::tuple<std::string, uint64_t, uint64_t>> evs;
+    evs.reserve(events.size());
+    for (auto item : events) {
+      py::dict d = item.cast<py::dict>();
+      evs.emplace_back(d["source"].cast<std::string>(),
+                       d["ptr"].cast<uint64_t>(),
+                       d["size"].cast<uint64_t>());
+    }
+    auto stats = ::foundry::replay_passthrough_events_internal(evs);
+    py::dict result;
+    result["alloc"]        = std::get<0>(stats);
+    result["reserve"]      = std::get<1>(stats);
+    result["free_skipped"] = std::get<2>(stats);
+    result["other"]        = std::get<3>(stats);
+    return result;
+  }, "Replay save-time passthrough events on load side. Each alloc routes through "
+     "Foundry's bump allocator to advance the cursor to save-time position.");
+
   py::class_<::foundry::KernelNodeMetadata>(m, "KernelNodeMetadata")
       .def_property_readonly("func", [](const ::foundry::KernelNodeMetadata& self) {
           return reinterpret_cast<uintptr_t>(self.func);

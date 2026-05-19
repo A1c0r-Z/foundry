@@ -3,6 +3,7 @@
 #include <ATen/cuda/Exceptions.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <ATen/cuda/MemPool.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/driver_api.h>
 #include "CUDAGraph.h"
@@ -159,7 +160,7 @@ c10::intrusive_ptr<at::CUDAGeneratorState> CUDAGeneratorStateRegistry::get_state
 }
 
 MempoolId_t graph_pool_handle() {
-  return c10::cuda::MemPool::graph_pool_handle();
+  return at::cuda::MemPool::graph_pool_handle();
 }
 
 void preallocate_cublas_workspaces() {
@@ -226,7 +227,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
     TORCH_INTERNAL_ASSERT(!(pool.first && pool.second));
     mempool_id_ = pool;
   } else {
-    mempool_id_ = c10::cuda::MemPool::graph_pool_handle(false);
+    mempool_id_ = at::cuda::MemPool::graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(mempool_id_.first > 0);
   }
 
@@ -237,6 +238,10 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
       return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive && stream_capture_id == capture_id_;
   });
   foundry::resume_allocation_region();
+  // NOTE: do NOT clear here. start_hook_record no longer clears events because
+  // unconditional fallback recording must persist across init_device. Capture
+  // events for *this* graph are isolated by save_hook_events_to_json reading
+  // only events that occurred during this capture window.
   foundry::start_hook_record();
 
   AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream_, capture_mode));
@@ -1516,7 +1521,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     TORCH_INTERNAL_ASSERT(!(pool.first && pool.second));
     graph->mempool_id_ = pool;
   } else {
-    graph->mempool_id_ = c10::cuda::MemPool::graph_pool_handle(false);
+    graph->mempool_id_ = at::cuda::MemPool::graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(graph->mempool_id_.first > 0);
   }
 

@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include <variant>
+#include <vector>
 #include <boost/json.hpp>
 #undef cuGetProcAddress
 #undef cuCtxCreate
@@ -39,9 +41,17 @@ int init_nvshmem_for_loaded_modules();
 
 void start_hook_record();
 void end_hook_record();
+void pause_hook_record();
+void resume_hook_record();
 void clear_hook_events();
+std::vector<std::tuple<std::string, uint64_t, uint64_t>> get_hook_events_simple();
 boost::json::object save_hook_events_to_json();
 void replay_hook_events_from_json(const boost::json::object& events_obj);
+
+// Direction 1: replay save-time passthrough events on load side.
+// Returns (n_alloc, n_reserve, n_free_skipped, n_other).
+std::tuple<int, int, int, int> replay_passthrough_events_internal(
+    const std::vector<std::tuple<std::string, uint64_t, uint64_t>>& events);
 
 std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash, const std::string& function_name);
 uint64_t query_binary_hash(std::variant<CUmodule, CUlibrary> handle);

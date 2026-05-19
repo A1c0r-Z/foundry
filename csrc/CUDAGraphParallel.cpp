@@ -3,6 +3,7 @@
 #include <ATen/cuda/Exceptions.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <ATen/cuda/MemPool.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/driver_api.h>
 #include "CUDAGraph.h"
@@ -120,7 +121,7 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(
     TORCH_INTERNAL_ASSERT(!(pool.first && pool.second));
     graph->mempool_id_ = pool;
   } else {
-    graph->mempool_id_ = c10::cuda::MemPool::graph_pool_handle(false);
+    graph->mempool_id_ = at::cuda::MemPool::graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(graph->mempool_id_.first > 0);
   }
 
@@ -1541,7 +1542,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 
   MempoolId_t resolved_pool = pool;
   if (resolved_pool.first == 0 && resolved_pool.second == 0) {
-    resolved_pool = c10::cuda::MemPool::graph_pool_handle(false);
+    resolved_pool = at::cuda::MemPool::graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(resolved_pool.first > 0);
   }
 

@@ -260,6 +260,18 @@ struct HookAllocationEvent {
 
 static std::atomic<bool> hook_recording_enabled{false};
 static std::vector<HookAllocationEvent> hook_alloc_events;
+// Marker: index into hook_alloc_events where the current capture window
+// started. save_hook_events_to_json only emits events at index >= this
+// marker, so events from prior recording windows (vllm-cold-start passthrough)
+// don't leak into a graph's allocator_events.
+static size_t hook_capture_start_index = 0;
+// Separate vector for fallback allocations (cuMemCreate/cuMemMap/cuMemSetAccess
+// failures fall back to driver cuMemAlloc_v2, returning driver-chosen VAs).
+// These are recorded unconditionally — they happen rarely but produce VMM
+// reservations that PyTorch's caching allocator later carves tensors out of.
+// Kept separate from hook_alloc_events because the latter is cleared on every
+// CUDAGraph::capture_end, which would otherwise wipe these out.
+static std::vector<HookAllocationEvent> hook_fallback_events;
 static std::mutex hook_events_mutex;
 static CUdeviceptr hook_recording_start_base_addr{0};
 
@@ -2100,7 +2112,24 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     auto real_func = (cuMemAlloc_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAlloc_v2);
 
     if (!tls_storage.enabled || !tls_storage.region_initialized) {
-        return real_func(dptr, bytesize);
+        // PASSTHROUGH PATH: bump allocator is off. Still record the alloc
+        // if passthrough recording is enabled — these are the non-bump
+        // GPU allocations (cuBLAS workspaces, NCCL buffers, etc.) that
+        // vllm-cold-start needs to track for address remapping.
+        CUresult result = real_func(dptr, bytesize);
+        if (result == CUDA_SUCCESS) {
+            fprintf(stderr, "[ALLOC_TRACE] cuMemAlloc_v2 path=PASSTHROUGH ptr=0x%llx size=%zu\n",
+                    (unsigned long long)*dptr, bytesize);
+            if (hook_recording_enabled.load()) {
+                std::lock_guard<std::mutex> lock(hook_events_mutex);
+                HookAllocationEvent event;
+                event.type = HookAllocationEvent::Type::Alloc;
+                event.size = bytesize;
+                event.ptr = *dptr;
+                hook_alloc_events.push_back(event);
+            }
+        }
+        return result;
     }
 
     // Use cached device and granularity to avoid driver calls on every allocation
@@ -2148,10 +2177,8 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
             hook_alloc_events.push_back(event);
         }
 
-#ifdef HOOK_DEBUG
-        fprintf(stderr, "[HOOK] cuMemAlloc_v2 (FAST PATH) ptr=%llu size=%zu aligned_size=%zu\n",
-                (unsigned long long)*dptr, bytesize, aligned_size);
-#endif
+        fprintf(stderr, "[ALLOC_TRACE] cuMemAlloc_v2 path=BUMP_FAST ptr=0x%llx size=%zu\n",
+                (unsigned long long)*dptr, bytesize);
 
         return CUDA_SUCCESS;
     }
@@ -2178,7 +2205,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
                 hook_alloc_events.push_back(event);
             }
 
-            fprintf(stderr, "[HOOK] cuMemAlloc_v2 (IDEMPOTENT) reusing pre-mapped 0x%llx size=%zu\n",
+            fprintf(stderr, "[ALLOC_TRACE] cuMemAlloc_v2 path=BUMP_IDEMPOTENT ptr=0x%llx size=%zu\n",
                     (unsigned long long)target_addr, bytesize);
             return CUDA_SUCCESS;
         }
@@ -2203,15 +2230,30 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 
     CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
     if (result != CUDA_SUCCESS) {
-        fprintf(stderr, "[HOOK] ERROR: cuMemCreate failed with error %d for size=%zu\n", result, aligned_size);
-        return real_func(dptr, bytesize);
+        fprintf(stderr, "[HOOK] ERROR: cuMemCreate failed with error %d for size=%zu — FALLBACK to real cuMemAlloc_v2\n", result, aligned_size);
+        CUresult fb = real_func(dptr, bytesize);
+        if (fb == CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK_FALLBACK_TRACE] cuMemAlloc_v2 fallback (cuMemCreate fail): ptr=0x%llx size=%zu\n",
+                    (unsigned long long)*dptr, bytesize);
+            // Fallback allocations are RARE but produce driver-chosen VAs
+            // that PyTorch's caching allocator will later carve tensors out of.
+            // Record unconditionally so the load process can replay them and
+            // build a correct save_ptr->load_ptr remap.
+            {
+                std::lock_guard<std::mutex> lock(hook_events_mutex);
+                HookAllocationEvent ev; ev.type = HookAllocationEvent::Type::Alloc;
+                ev.size = bytesize; ev.ptr = *dptr;
+                hook_fallback_events.push_back(ev);
+            }
+        }
+        return fb;
     }
 
     result = mem_map_func(target_addr, aligned_size, 0, allocHandle, 0);
     if (result != CUDA_SUCCESS) {
         fprintf(stderr, "[HOOK] ERROR: cuMemMap failed with error %d at cuMemAlloc_v2 "
                 "addr=0x%llx size=%zu (requested=%zu) alloc_base=0x%llx has_prealloc=%d "
-                "prealloc_start=0x%llx prealloc_end=0x%llx\n",
+                "prealloc_start=0x%llx prealloc_end=0x%llx — FALLBACK\n",
                 result,
                 (unsigned long long)target_addr, aligned_size, bytesize,
                 (unsigned long long)tls_storage.current_alloc_base_addr,
@@ -2221,7 +2263,22 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
         typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
         auto mem_release_func = (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
         mem_release_func(allocHandle);
-        return real_func(dptr, bytesize);
+        CUresult fb = real_func(dptr, bytesize);
+        if (fb == CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK_FALLBACK_TRACE] cuMemAlloc_v2 fallback (cuMemMap fail): ptr=0x%llx size=%zu\n",
+                    (unsigned long long)*dptr, bytesize);
+            // Fallback allocations are RARE but produce driver-chosen VAs
+            // that PyTorch's caching allocator will later carve tensors out of.
+            // Record unconditionally so the load process can replay them and
+            // build a correct save_ptr->load_ptr remap.
+            {
+                std::lock_guard<std::mutex> lock(hook_events_mutex);
+                HookAllocationEvent ev; ev.type = HookAllocationEvent::Type::Alloc;
+                ev.size = bytesize; ev.ptr = *dptr;
+                hook_fallback_events.push_back(ev);
+            }
+        }
+        return fb;
     }
 
     CUmemAccessDesc accessDesc = {};
@@ -2231,14 +2288,29 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 
     result = mem_set_access_func(target_addr, aligned_size, &accessDesc, 1);
     if (result != CUDA_SUCCESS) {
-        fprintf(stderr, "[HOOK] ERROR: cuMemSetAccess failed with error %d\n", result);
+        fprintf(stderr, "[HOOK] ERROR: cuMemSetAccess failed with error %d — FALLBACK\n", result);
         typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
         auto mem_unmap_func = (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
         typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
         auto mem_release_func = (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
         mem_unmap_func(target_addr, aligned_size);
         mem_release_func(allocHandle);
-        return real_func(dptr, bytesize);
+        CUresult fb = real_func(dptr, bytesize);
+        if (fb == CUDA_SUCCESS) {
+            fprintf(stderr, "[HOOK_FALLBACK_TRACE] cuMemAlloc_v2 fallback (cuMemSetAccess fail): ptr=0x%llx size=%zu\n",
+                    (unsigned long long)*dptr, bytesize);
+            // Fallback allocations are RARE but produce driver-chosen VAs
+            // that PyTorch's caching allocator will later carve tensors out of.
+            // Record unconditionally so the load process can replay them and
+            // build a correct save_ptr->load_ptr remap.
+            {
+                std::lock_guard<std::mutex> lock(hook_events_mutex);
+                HookAllocationEvent ev; ev.type = HookAllocationEvent::Type::Alloc;
+                ev.size = bytesize; ev.ptr = *dptr;
+                hook_fallback_events.push_back(ev);
+            }
+        }
+        return fb;
     }
 
     *dptr = target_addr;
@@ -2273,10 +2345,8 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
         hook_alloc_events.push_back(event);
     }
 
-#ifdef HOOK_DEBUG
-    fprintf(stderr, "[HOOK] cuMemAlloc_v2 (SLOW PATH) ptr=%llu size=%zu aligned_size=%zu\n",
-            (unsigned long long)*dptr, bytesize, aligned_size);
-#endif
+    fprintf(stderr, "[ALLOC_TRACE] cuMemAlloc_v2 path=BUMP_SLOW ptr=0x%llx size=%zu\n",
+            (unsigned long long)*dptr, bytesize);
 
     return CUDA_SUCCESS;
 }
@@ -2286,7 +2356,17 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
     auto real_func = (cuMemAllocPitch_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAllocPitch_v2);
 
     if (!tls_storage.enabled || !tls_storage.region_initialized) {
-        return real_func(dptr, pPitch, WidthInBytes, Height, ElementSizeBytes);
+        // PASSTHROUGH PATH — record if recording enabled (see cuMemAlloc_v2).
+        CUresult result = real_func(dptr, pPitch, WidthInBytes, Height, ElementSizeBytes);
+        if (result == CUDA_SUCCESS && hook_recording_enabled.load()) {
+            std::lock_guard<std::mutex> lock(hook_events_mutex);
+            HookAllocationEvent event;
+            event.type = HookAllocationEvent::Type::Alloc;
+            event.size = (*pPitch) * Height;
+            event.ptr = *dptr;
+            hook_alloc_events.push_back(event);
+        }
+        return result;
     }
 
     // First, call real function to get the pitch value, then free immediately
@@ -2508,15 +2588,30 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
     auto real_func = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressReserve);
 
     if (!tls_storage.enabled || !tls_storage.region_initialized) {
-        return real_func(ptr, size, alignment, addr, flags);
+        // PASSTHROUGH PATH — record if recording enabled (see cuMemAlloc_v2).
+        CUresult result = real_func(ptr, size, alignment, addr, flags);
+        if (result == CUDA_SUCCESS) {
+            fprintf(stderr, "[ALLOC_TRACE] cuMemAddressReserve path=PASSTHROUGH ptr=0x%llx size=%zu hint=0x%llx\n",
+                    (unsigned long long)*ptr, size, (unsigned long long)addr);
+            if (hook_recording_enabled.load()) {
+                std::lock_guard<std::mutex> lock(hook_events_mutex);
+                HookAllocationEvent event;
+                event.type = HookAllocationEvent::Type::Reserve;
+                event.size = size;
+                event.ptr = *ptr;
+                event.alignment = alignment;
+                hook_alloc_events.push_back(event);
+            }
+        }
+        return result;
     }
 
     if (addr != 0) {
         CUresult result = real_func(ptr, size, alignment, addr, flags);
-#ifdef HOOK_DEBUG
-        fprintf(stderr, "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx addr=0x%llx (user-specified)\n",
-                (unsigned long long)*ptr, size, alignment, (unsigned long long)addr);
-#endif
+        if (result == CUDA_SUCCESS) {
+            fprintf(stderr, "[ALLOC_TRACE] cuMemAddressReserve path=USER_HINT ptr=0x%llx size=%zu hint=0x%llx\n",
+                    (unsigned long long)*ptr, size, (unsigned long long)addr);
+        }
         return result;
     }
 
@@ -2548,10 +2643,8 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
             hook_alloc_events.push_back(event);
         }
 
-#ifdef HOOK_DEBUG
-        fprintf(stderr, "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx (carved from reserved region), next_alloc_base=0x%llx\n",
-                (unsigned long long)*ptr, size, alignment, (unsigned long long)tls_storage.current_alloc_base_addr);
-#endif
+        fprintf(stderr, "[ALLOC_TRACE] cuMemAddressReserve path=BUMP_CARVE ptr=0x%llx size=%zu\n",
+                (unsigned long long)*ptr, size);
         return CUDA_SUCCESS;
     }
 
@@ -2571,10 +2664,20 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
 
     tls_storage.current_vmm_reserve_addr = align_to(*ptr + size, alignment);
 
-#ifdef HOOK_DEBUG
-    fprintf(stderr, "[HOOK] cuMemAddressReserve ptr=0x%llx size=0x%zx alignment=0x%zx (large alloc, VMM hint), next_vmm_reserve=0x%llx\n",
-            (unsigned long long)*ptr, size, alignment, (unsigned long long)tls_storage.current_vmm_reserve_addr);
-#endif
+    // Record large VMM reservations even while bump is enabled so the load
+    // process can remap PyTorch's expandable-segment VAs.
+    if (hook_recording_enabled.load()) {
+        std::lock_guard<std::mutex> lock(hook_events_mutex);
+        HookAllocationEvent event;
+        event.type = HookAllocationEvent::Type::Reserve;
+        event.size = size;
+        event.ptr = *ptr;
+        event.alignment = alignment;
+        hook_alloc_events.push_back(event);
+    }
+
+    fprintf(stderr, "[ALLOC_TRACE] cuMemAddressReserve path=VMM_HINT ptr=0x%llx size=%zu hint_used=0x%llx\n",
+            (unsigned long long)*ptr, size, (unsigned long long)hint_addr);
 
     return CUDA_SUCCESS;
 }
@@ -3108,12 +3211,137 @@ void set_current_alloc_offset(size_t offset) {
 }
 
 void start_hook_record() {
+    // NOTE: Do NOT clear events here. The fallback paths in cuMemAlloc_v2
+    // unconditionally record (because those allocations happen before
+    // hook_recording_enabled is set by vllm-cold-start's init_device hook),
+    // and we want to preserve those early fallback events. The CUDAGraph
+    // capture flow uses hook_capture_start_index to isolate the capture
+    // window from earlier events. Call clear_hook_events() explicitly from
+    // Python if a clean slate is required.
     hook_recording_start_base_addr = tls_storage.current_alloc_base_addr;
+    {
+        std::lock_guard<std::mutex> lock(hook_events_mutex);
+        hook_capture_start_index = hook_alloc_events.size();
+    }
     hook_recording_enabled.store(true);
 }
 
 void end_hook_record() {
     hook_recording_enabled.store(false);
+}
+
+// pause/resume are toggles that do NOT clear start_base_addr or events —
+// they just gate whether allocs hitting the interceptors get recorded.
+void pause_hook_record() {
+    hook_recording_enabled.store(false);
+}
+
+void resume_hook_record() {
+    hook_recording_enabled.store(true);
+}
+
+// Python-friendly event accessor. Returns vector of (source, ptr, size)
+// triples that vllm-cold-start's _build_passthrough_addr_map can consume.
+// Returns fallback events first (deterministic order: fallbacks always happen
+// during process init, before user-driven recording starts), then the normal
+// hook_alloc_events captured during the recording window.
+std::vector<std::tuple<std::string, uint64_t, uint64_t>> get_hook_events_simple() {
+    std::lock_guard<std::mutex> lock(hook_events_mutex);
+    std::vector<std::tuple<std::string, uint64_t, uint64_t>> result;
+    result.reserve(hook_fallback_events.size() + hook_alloc_events.size());
+    auto emit = [&](const HookAllocationEvent& e) {
+        const char* source =
+            (e.type == HookAllocationEvent::Type::Alloc)   ? "alloc"   :
+            (e.type == HookAllocationEvent::Type::Free)    ? "free"    :
+            (e.type == HookAllocationEvent::Type::Reserve) ? "reserve" :
+                                                              "unknown";
+        result.emplace_back(std::string(source),
+                            static_cast<uint64_t>(e.ptr),
+                            e.size);
+    };
+    for (const auto& e : hook_fallback_events) emit(e);
+    for (const auto& e : hook_alloc_events)    emit(e);
+    return result;
+}
+
+// Direction 1: replay save-time passthrough events on load side. Each "alloc"
+// event triggers a cuMemAlloc_v2(size) call which routes through Foundry's
+// bump allocator and advances the cursor to match save's trajectory. After
+// the full replay, save-time addresses (kernel params, output_tensors,
+// memcpy/memset addrs) are valid in the load process.
+//
+// We skip "free" events: the load process keeps everything alive until exit.
+// "reserve" events get a cuMemAddressReserve at the save-time hint — these
+// are typically large VMM segments and the bump allocator handles them.
+std::tuple<int, int, int, int> replay_passthrough_events_internal(
+    const std::vector<std::tuple<std::string, uint64_t, uint64_t>>& events) {
+    typedef CUresult (*cuMemAlloc_t)(CUdeviceptr*, size_t);
+    typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long);
+
+    auto alloc_fn   = (cuMemAlloc_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAlloc_v2);
+    auto reserve_fn = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAddressReserve);
+
+    int n_alloc = 0, n_reserve = 0, n_free = 0, n_other = 0;
+    int n_failed = 0;
+    int n_addr_match = 0;   // got == expected
+    int n_addr_mismatch = 0; // got != expected
+    int n_bump_region = 0;   // got in bump region
+    int n_outside_bump = 0;  // got outside bump (non-bump path returned)
+
+    for (const auto& e : events) {
+        const std::string& source = std::get<0>(e);
+        uint64_t expected_ptr = std::get<1>(e);
+        uint64_t size = std::get<2>(e);
+
+        if (source == "alloc") {
+            if (size == 0) { n_alloc++; continue; }
+            CUdeviceptr got = 0;
+            CUresult r = alloc_fn(&got, size);
+            if (r != CUDA_SUCCESS) {
+                n_failed++;
+                if (n_failed <= 5) {
+                    fprintf(stderr, "[REPLAY_PT] cuMemAlloc_v2(size=%llu) FAILED expected=0x%llx err=%d\n",
+                            (unsigned long long)size, (unsigned long long)expected_ptr, r);
+                }
+            } else {
+                bool in_bump = (got >= 0x10000000000ULL && got < 0x10900000000ULL);
+                if (in_bump) n_bump_region++; else n_outside_bump++;
+                if (got == expected_ptr) {
+                    n_addr_match++;
+                } else {
+                    n_addr_mismatch++;
+                    if (n_addr_mismatch <= 8) {
+                        fprintf(stderr, "[REPLAY_PT] mismatch: got=0x%llx expected=0x%llx size=%llu %s\n",
+                                (unsigned long long)got, (unsigned long long)expected_ptr,
+                                (unsigned long long)size, in_bump ? "(bump)" : "(non-bump)");
+                    }
+                }
+            }
+            n_alloc++;
+        } else if (source == "reserve") {
+            if (size == 0) { n_reserve++; continue; }
+            CUdeviceptr got = 0;
+            CUresult r = reserve_fn(&got, size, 0, (CUdeviceptr)expected_ptr, 0);
+            if (r != CUDA_SUCCESS) {
+                n_failed++;
+                if (n_failed <= 5) {
+                    fprintf(stderr, "[REPLAY_PT] cuMemAddressReserve(size=%llu hint=0x%llx) failed: err=%d\n",
+                            (unsigned long long)size, (unsigned long long)expected_ptr, r);
+                }
+            }
+            n_reserve++;
+        } else if (source == "free") {
+            n_free++;
+        } else {
+            n_other++;
+        }
+    }
+
+    fprintf(stderr, "[REPLAY_PT] Done: %d alloc, %d reserve, %d free_skipped, %d other, %d failures\n",
+            n_alloc, n_reserve, n_free, n_other, n_failed);
+    fprintf(stderr, "[REPLAY_PT] Address match summary: %d match, %d mismatch, %d in bump, %d outside bump\n",
+            n_addr_match, n_addr_mismatch, n_bump_region, n_outside_bump);
+    return {n_alloc, n_reserve, n_free, n_other};
 }
 
 void clear_hook_events() {
@@ -3127,7 +3355,12 @@ boost::json::object save_hook_events_to_json() {
     namespace json = boost::json;
     json::array events_array;
 
-    for (const auto& event : hook_alloc_events) {
+    // Only emit events captured AFTER the most recent start_hook_record call,
+    // so vllm-cold-start's passthrough events (recorded into the same vector
+    // before capture started) don't pollute this graph's allocator_events.
+    size_t emit_from = std::min(hook_capture_start_index, hook_alloc_events.size());
+    for (size_t i = emit_from; i < hook_alloc_events.size(); ++i) {
+        const auto& event = hook_alloc_events[i];
         json::object event_obj;
         if (event.type == HookAllocationEvent::Type::Alloc) {
             event_obj["type"] = "alloc";

@@ -359,3 +359,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Foundry runtime artifacts (built/generated, not source)
+hook_archive/
+python/foundry/*.so
